@@ -1,51 +1,78 @@
 package com.example.todotime.worker
 
-import android.app.NotificationManager
-import android.content.Context
-import androidx.core.app.NotificationCompat
 import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
-import com.example.todotime.R
 import com.example.todotime.data.AppDatabase
-import com.google.firebase.firestore.FirebaseFirestore
-import kotlinx.coroutines.tasks.await
+import com.example.todotime.data.TaskEntity
+import com.example.todotime.notification.TaskNotifications
+import com.example.todotime.sync.JsonPlaceholderClient
+import com.example.todotime.sync.JsonPlaceholderCreateTodoRequest
+import com.example.todotime.sync.SyncPreferences
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
-class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
+class SyncWorker(
+    context: android.content.Context,
+    params: WorkerParameters
+) : CoroutineWorker(context, params) {
 
     override suspend fun doWork(): Result {
         val db = AppDatabase.getDatabase(applicationContext)
-        val firestore = FirebaseFirestore.getInstance()
-        val userId = "V7jMNV5PsaeXhnnw3nn8ohwFKDE2" // Твой ID
+        val dao = db.taskDao()
+        val api = JsonPlaceholderClient.api
 
         return try {
-            // 1. Синхронизация с Firebase
-            val tasks = db.taskDao().getAllTasksList()
-            for (task in tasks) {
-                firestore.collection("users").document(userId)
-                    .collection("tasks").document(task.id)
-                    .set(task).await()
+            val remoteTodos = api.getTodos(limit = 40)
+
+            remoteTodos.forEach { todo ->
+                val mapped = TaskEntity(
+                    id = "jp-${todo.id}",
+                    title = todo.title,
+                    isCompleted = todo.completed,
+                    tag = mapTodoToTag(todo.id),
+                    hasTimer = false,
+                    timeSpentSeconds = 0L,
+                    createdAt = System.currentTimeMillis() - todo.id * 1_000L
+                )
+                dao.insert(mapped)
             }
 
-            // 2. Показываем уведомление (Требование ТЗ)
-            showNotification("Синхронизация завершена", "Все задачи успешно выгружены в облако")
+            // Демонстрация двустороннего sync: отправляем часть локальных задач на mock API.
+            val localTasks = dao.getAllTasksList().take(5)
+            localTasks.forEach { task ->
+                api.createTodo(
+                    JsonPlaceholderCreateTodoRequest(
+                        userId = 1,
+                        title = task.title,
+                        completed = task.isCompleted
+                    )
+                )
+            }
+
+            val now = System.currentTimeMillis()
+            SyncPreferences.saveLastSyncTime(applicationContext, now)
+            TaskNotifications.showSyncCompleted(
+                context = applicationContext,
+                contentText = "Последняя синхронизация: ${formatTimestamp(now)}"
+            )
 
             Result.success()
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             Result.retry()
         }
     }
 
-    private fun showNotification(title: String, message: String) {
-        val notificationManager = applicationContext.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+    private fun mapTodoToTag(id: Int): String {
+        return when (id % 3) {
+            0 -> "intel"
+            1 -> "strength"
+            else -> "craft"
+        }
+    }
 
-        val notification = NotificationCompat.Builder(applicationContext, "SYNC_CHANNEL")
-            .setSmallIcon(R.drawable.ic_launcher_foreground) // Проверь, есть ли такой ресурс, или замени на свой
-            .setContentTitle(title)
-            .setContentText(message)
-            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
-            .setAutoCancel(true)
-            .build()
-
-        notificationManager.notify(1, notification)
+    private fun formatTimestamp(timestampMs: Long): String {
+        val formatter = SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.getDefault())
+        return formatter.format(Date(timestampMs))
     }
 }

@@ -190,13 +190,18 @@ fun TodoScreen(viewModel: TodoViewModel, onAccountClick: () -> Unit) {
                 contentPadding = PaddingValues(top = 8.dp, bottom = 96.dp)
             ) {
                 items(activeTasks, key = { it.id }) { task ->
-                    val isActive = viewModel.activeTaskId.value == task.id
+                    val taskTimer = sharedTimer?.takeIf { it.isRunning && it.taskId == task.id }
                     TaskItemCard(
                         task = task,
-                        isActive = isActive,
-                        sharedTimer = sharedTimer,
+                        runningTimer = taskTimer,
                         onToggle = { viewModel.toggleTask(task) },
-                        onTimerClick = { if (isActive) viewModel.stopTimer() else viewModel.startTimer(task) },
+                        onTimerClick = {
+                            if (taskTimer != null) {
+                                viewModel.stopTimerForTask(task.id)
+                            } else {
+                                viewModel.startTimer(task)
+                            }
+                        },
                         onEdit = {
                             taskToEdit = task
                             showDialog = true
@@ -207,8 +212,7 @@ fun TodoScreen(viewModel: TodoViewModel, onAccountClick: () -> Unit) {
                 items(completedTasks, key = { it.id }) { task ->
                     TaskItemCard(
                         task = task,
-                        isActive = false,
-                        sharedTimer = null,
+                        runningTimer = null,
                         onToggle = { viewModel.toggleTask(task) },
                         onTimerClick = {},
                         onEdit = {
@@ -226,17 +230,13 @@ fun TodoScreen(viewModel: TodoViewModel, onAccountClick: () -> Unit) {
 @Composable
 private fun TaskItemCard(
     task: TaskEntity,
-    isActive: Boolean,
-    sharedTimer: ActiveTimer?,
+    runningTimer: ActiveTimer?,
     onToggle: () -> Unit,
     onTimerClick: () -> Unit,
     onEdit: () -> Unit
 ) {
-    val timerStart = sharedTimer
-        ?.takeIf { it.isRunning && it.taskId == task.id }
-        ?.startTime
-        ?: 0L
-    val isRunning = isActive && timerStart > 0L
+    val timerStart = runningTimer?.startTime ?: 0L
+    val isRunning = timerStart > 0L
 
     var displayTime by remember(task.id, task.timeSpentSeconds, isRunning, timerStart) {
         mutableLongStateOf(task.timeSpentSeconds)
@@ -249,7 +249,7 @@ private fun TaskItemCard(
         }
         while (true) {
             val elapsed = ((System.currentTimeMillis() - timerStart) / 1000).coerceAtLeast(0)
-            displayTime = task.timeSpentSeconds + elapsed
+            displayTime = elapsed
             delay(1000)
         }
     }

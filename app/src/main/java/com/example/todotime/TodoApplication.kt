@@ -7,15 +7,15 @@ import android.content.Context
 import android.os.Build
 import com.example.todotime.data.AppDatabase
 import com.example.todotime.data.TodoRepository
+import com.example.todotime.notification.TaskNotifications
+import com.example.todotime.worker.SyncWorkScheduler
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.FirebaseFirestore
 
 class TodoApplication : Application() {
 
-    // Инициализация базы Room
     val database by lazy { AppDatabase.getDatabase(this) }
 
-    // Теперь передаем все 3 параметра: DAO, Firestore и Auth
     val repository by lazy {
         TodoRepository(
             taskDao = database.taskDao(),
@@ -26,20 +26,32 @@ class TodoApplication : Application() {
 
     override fun onCreate() {
         super.onCreate()
-        createNotificationChannel()
+        createNotificationChannels()
+        SyncWorkScheduler.schedulePeriodicSync(this)
     }
 
-    private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val name = "Sync Notifications"
-            val descriptionText = "Уведомления о синхронизации задач"
-            val importance = NotificationManager.IMPORTANCE_DEFAULT
-            val channel = NotificationChannel("SYNC_CHANNEL", name, importance).apply {
-                description = descriptionText
-            }
-            val notificationManager: NotificationManager =
-                getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            notificationManager.createNotificationChannel(channel)
+    private fun createNotificationChannels() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+
+        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+
+        val syncChannel = NotificationChannel(
+            TaskNotifications.SYNC_CHANNEL_ID,
+            "Sync Notifications",
+            NotificationManager.IMPORTANCE_DEFAULT
+        ).apply {
+            description = "Уведомления о синхронизации задач"
         }
+
+        val externalTaskChannel = NotificationChannel(
+            TaskNotifications.EXTERNAL_TASK_CHANNEL_ID,
+            "External Tasks",
+            NotificationManager.IMPORTANCE_DEFAULT
+        ).apply {
+            description = "Уведомления о задачах, добавленных извне"
+        }
+
+        manager.createNotificationChannel(syncChannel)
+        manager.createNotificationChannel(externalTaskChannel)
     }
 }

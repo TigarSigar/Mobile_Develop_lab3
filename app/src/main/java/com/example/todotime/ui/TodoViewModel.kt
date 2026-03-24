@@ -8,9 +8,11 @@ import com.example.todotime.data.TaskEntity
 import com.example.todotime.data.TodoRepository
 import com.example.todotime.data.UserTimeStats
 import com.example.todotime.data.model.ActiveTimer
+import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.remoteconfig.FirebaseRemoteConfig
 import com.google.firebase.remoteconfig.FirebaseRemoteConfigSettings
 import com.google.gson.Gson
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -18,6 +20,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 data class TdtTagConfig(
     val id: String = "",
@@ -39,7 +43,6 @@ class TodoViewModel(private val repository: TodoRepository) : ViewModel() {
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     var activeTaskId = mutableStateOf<String?>(null)
-    private var localStartTimeMs: Long? = null
 
     private val _sharedTimer = MutableStateFlow<ActiveTimer?>(null)
     val sharedTimer: StateFlow<ActiveTimer?> = _sharedTimer.asStateFlow()
@@ -52,19 +55,28 @@ class TodoViewModel(private val repository: TodoRepository) : ViewModel() {
 
     // Pair<ConflictingTimer, TaskUserWantsToStart>
     val conflictTimerState = mutableStateOf<Pair<ActiveTimer, TaskEntity>?>(null)
+    private val stopMutex = Mutex()
+    private val auth = FirebaseAuth.getInstance()
+    private var sharedTimerJob: Job? = null
+    private val authStateListener = FirebaseAuth.AuthStateListener {
+        subscribeSharedTimer()
+    }
 
     init {
         fetchRemoteConfig()
+        subscribeSharedTimer()
+        auth.addAuthStateListener(authStateListener)
+    }
 
-        viewModelScope.launch {
+    private fun subscribeSharedTimer() {
+        sharedTimerJob?.cancel()
+        sharedTimerJob = viewModelScope.launch {
             repository.getSharedTimerFlow().collectLatest { timer ->
                 _sharedTimer.value = timer
-                if (timer != null && timer.isRunning && timer.sourceApp == "TDT") {
+                if (timer != null && timer.isRunning && timer.taskId.isNotBlank()) {
                     activeTaskId.value = timer.taskId
-                    localStartTimeMs = timer.startTime
                 } else {
                     activeTaskId.value = null
-                    localStartTimeMs = null
                 }
             }
         }
@@ -107,52 +119,53 @@ class TodoViewModel(private val repository: TodoRepository) : ViewModel() {
 
     fun deleteTask(task: TaskEntity) {
         viewModelScope.launch {
-            if (activeTaskId.value == task.id) stopTimer()
+            val runningThisTask = _sharedTimer.value?.let { it.isRunning && it.taskId == task.id } == true
+            if (runningThisTask) {
+                val stopped = stopActiveTimer(expectedTaskId = task.id)
+                val stillRunning = _sharedTimer.value?.let { it.isRunning && it.taskId == task.id } == true
+                if (!stopped && stillRunning) return@launch
+            }
             repository.delete(task)
         }
     }
 
     fun toggleTask(task: TaskEntity) {
         viewModelScope.launch {
-            if (activeTaskId.value == task.id) stopTimer()
+            val runningThisTask = _sharedTimer.value?.let { it.isRunning && it.taskId == task.id } == true
+            if (runningThisTask) {
+                val stopped = stopActiveTimer(expectedTaskId = task.id)
+                val stillRunning = _sharedTimer.value?.let { it.isRunning && it.taskId == task.id } == true
+                if (!stopped && stillRunning) return@launch
+            }
             repository.update(task.copy(isCompleted = !task.isCompleted))
         }
     }
 
     fun startTimer(task: TaskEntity) {
-        val currentRemoteTimer = _sharedTimer.value
-
-        if (
-            currentRemoteTimer != null &&
-            currentRemoteTimer.isRunning &&
-            currentRemoteTimer.sourceApp != "TDT"
-        ) {
-            conflictTimerState.value = currentRemoteTimer to task
-            return
-        }
-
         viewModelScope.launch {
-            if (
-                currentRemoteTimer != null &&
-                currentRemoteTimer.isRunning &&
-                currentRemoteTimer.sourceApp == "TDT" &&
-                currentRemoteTimer.taskId.isNotBlank() &&
-                currentRemoteTimer.taskId != task.id
-            ) {
-                val delta = ((System.currentTimeMillis() - currentRemoteTimer.startTime) / 1000)
-                    .coerceAtLeast(0)
-                repository.applyTimerDelta(currentRemoteTimer.taskId, delta)
+            val currentRemoteTimer = _sharedTimer.value
+            if (currentRemoteTimer != null && currentRemoteTimer.isRunning) {
+                if (currentRemoteTimer.taskId == task.id) {
+                    stopActiveTimer(expectedTaskId = task.id)
+                    return@launch
+                }
+                if (currentRemoteTimer.sourceApp != "TDT") {
+                    conflictTimerState.value = currentRemoteTimer to task
+                    return@launch
+                }
+                if (currentRemoteTimer.taskId.isNotBlank()) {
+                    val switched = stopActiveTimer(expectedTaskId = currentRemoteTimer.taskId)
+                    val stillRunning = _sharedTimer.value?.isRunning == true
+                    if (!switched && stillRunning) return@launch
+                }
             }
 
-            activeTaskId.value = task.id
-            val now = System.currentTimeMillis()
-            localStartTimeMs = now
             repository.updateSharedTimer(
                 ActiveTimer(
                     taskId = task.id,
                     taskName = task.title,
                     tag = task.tag,
-                    startTime = now,
+                    startTime = System.currentTimeMillis(),
                     isRunning = true,
                     sourceApp = "TDT"
                 )
@@ -162,15 +175,11 @@ class TodoViewModel(private val repository: TodoRepository) : ViewModel() {
 
     fun resolveTimerConflict(remoteTimer: ActiveTimer, newTaskToStart: TaskEntity) {
         viewModelScope.launch {
-            val elapsedSeconds = if (remoteTimer.startTime > 0) {
-                (System.currentTimeMillis() - remoteTimer.startTime) / 1000
-            } else 0
-
-            if (elapsedSeconds > 0) {
-                repository.applyTimerDelta(remoteTimer.taskId, elapsedSeconds)
+            val currentlyRunning = _sharedTimer.value?.isRunning == true
+            if (currentlyRunning) {
+                val stopped = stopActiveTimer()
+                if (!stopped && (_sharedTimer.value?.isRunning == true)) return@launch
             }
-
-            repository.clearSharedTimer()
             conflictTimerState.value = null
             startTimer(newTaskToStart)
         }
@@ -180,23 +189,46 @@ class TodoViewModel(private val repository: TodoRepository) : ViewModel() {
         conflictTimerState.value = null
     }
 
-    fun stopTimer() {
-        val currentTimer = _sharedTimer.value
-        val startTime = when {
-            currentTimer != null && currentTimer.isRunning && currentTimer.sourceApp == "TDT" -> currentTimer.startTime
-            localStartTimeMs != null -> localStartTimeMs ?: 0L
-            else -> 0L
-        }
-        if (startTime <= 0L) return
-        val taskId = currentTimer?.taskId?.takeIf { it.isNotBlank() } ?: activeTaskId.value.orEmpty()
-
-        val elapsedSeconds = ((System.currentTimeMillis() - startTime) / 1000).coerceAtLeast(0)
-
+    fun stopTimerForTask(taskId: String) {
         viewModelScope.launch {
-            repository.applyTimerDelta(taskId, elapsedSeconds)
-            repository.clearSharedTimer()
+            stopActiveTimer(expectedTaskId = taskId)
         }
-        activeTaskId.value = null
-        localStartTimeMs = null
+    }
+
+    fun stopTimer() {
+        viewModelScope.launch {
+            stopActiveTimer()
+        }
+    }
+
+    private suspend fun stopActiveTimer(expectedTaskId: String? = null): Boolean {
+        return stopMutex.withLock {
+            val timer = _sharedTimer.value ?: return@withLock false
+            if (!timer.isRunning) return@withLock false
+            if (expectedTaskId != null && timer.taskId != expectedTaskId) return@withLock false
+
+            val taskId = timer.taskId.takeIf { it.isNotBlank() } ?: run {
+                repository.clearSharedTimer()
+                return@withLock true
+            }
+
+            val elapsedSeconds = if (timer.startTime > 0L) {
+                ((System.currentTimeMillis() - timer.startTime) / 1000).coerceAtLeast(0)
+            } else {
+                0L
+            }
+
+            val saved = repository.applyTimerDelta(taskId, elapsedSeconds)
+            if (!saved) return@withLock false
+
+            repository.clearSharedTimer()
+            return@withLock true
+        }
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        sharedTimerJob?.cancel()
+        auth.removeAuthStateListener(authStateListener)
     }
 }

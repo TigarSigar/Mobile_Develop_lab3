@@ -1,15 +1,15 @@
+# Gradle кэш и локальные настройки
+.gradle/
+.gradle-local/
+build/
+
+# Android Studio и IDE
+.idea/
 *.iml
-.gradle
-/local.properties
-/.idea/caches
-/.idea/libraries
-/.idea/modules.xml
-/.idea/workspace.xml
-/.idea/navEditor.xml
-/.idea/assetWizardSettings.xml
-.DS_Store
-/build
-/captures
-.externalNativeBuild
-.cxx
+.kotlin/
+
+# Локальные конфиги
 local.properties
+
+# Скомпилированные файлы в папках модулей
+**/build/
