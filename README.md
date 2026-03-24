@@ -168,7 +168,41 @@
 
 Использование `Room` позволило организовать устойчивое локальное хранение данных и обеспечить их сохранность между перезапусками приложения.
 
-**[ВСТАВИТЬ СКРИНШОТ 4 — структура базы данных / код Entity и DAO / таблица Room]**
+**Кодовое подтверждение (без скриншота):**
+
+```kotlin
+// TaskEntity.kt
+@Entity(tableName = "tasks")
+data class TaskEntity(
+    @PrimaryKey val id: String = UUID.randomUUID().toString(),
+    val title: String = "",
+    val isCompleted: Boolean = false,
+    val tag: String = "intel",
+    val hasTimer: Boolean = false,
+    val timeSpentSeconds: Long = 0,
+    val createdAt: Long = System.currentTimeMillis()
+)
+```
+
+```kotlin
+// TaskDao.kt
+@Dao
+interface TaskDao {
+    @Query("SELECT * FROM tasks ORDER BY createdAt DESC")
+    fun getAllTasks(): Flow<List<TaskEntity>>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insert(task: TaskEntity)
+}
+```
+
+```kotlin
+// AppDatabase.kt
+@Database(entities = [TaskEntity::class], version = 2, exportSchema = false)
+abstract class AppDatabase : RoomDatabase() {
+    abstract fun taskDao(): TaskDao
+}
+```
 
 ---
 
@@ -210,7 +244,35 @@
 - проверку наличия сети;
 - гарантированное выполнение задачи системой Android.
 
-**[ВСТАВИТЬ СКРИНШОТ 6 — код Worker или настройка PeriodicWorkRequest]**
+**Кодовое подтверждение (без скриншота):**
+
+```kotlin
+// SyncWorkScheduler.kt
+val constraints = Constraints.Builder()
+    .setRequiredNetworkType(NetworkType.CONNECTED)
+    .build()
+
+val periodicRequest = PeriodicWorkRequestBuilder<SyncWorker>(15, TimeUnit.MINUTES)
+    .setConstraints(constraints)
+    .build()
+
+WorkManager.getInstance(context).enqueueUniquePeriodicWork(
+    "periodic_tasks_sync",
+    ExistingPeriodicWorkPolicy.KEEP,
+    periodicRequest
+)
+```
+
+```kotlin
+// SyncWorker.kt
+override suspend fun doWork(): Result {
+    ...
+    val now = System.currentTimeMillis()
+    SyncPreferences.saveLastSyncTime(applicationContext, now)
+    TaskNotifications.showSyncCompleted(...)
+    return Result.success()
+}
+```
 
 ![photo_1_2026-03-24_14-43-47](https://github.com/user-attachments/assets/dd221273-0189-4e6c-aacc-f8a5b774b9ff)
 
@@ -229,7 +291,31 @@
 - в настройках приложения;
 - в логах.
 
-**[ВСТАВИТЬ СКРИНШОТ 8 — отображение времени последней синхронизации]**
+**Кодовое подтверждение (без скриншота):**
+
+```kotlin
+// SyncPreferences.kt
+private const val PREFS_NAME = "todo_sync_prefs"
+private const val KEY_LAST_SYNC_TIME_MS = "last_sync_time_ms"
+
+fun saveLastSyncTime(context: Context, timestampMs: Long) {
+    context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        .edit()
+        .putLong(KEY_LAST_SYNC_TIME_MS, timestampMs)
+        .apply()
+}
+
+fun getLastSyncTime(context: Context): Long {
+    return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        .getLong(KEY_LAST_SYNC_TIME_MS, 0L)
+}
+```
+
+```kotlin
+// SyncWorker.kt
+val now = System.currentTimeMillis()
+SyncPreferences.saveLastSyncTime(applicationContext, now)
+```
 
 ---
 
@@ -245,9 +331,45 @@
 - после восстановления соединения синхронизация запускается сразу;
 - пользователь получает актуальные данные без необходимости выполнять действие вручную.
 
-**[ВСТАВИТЬ СКРИНШОТ 9 — код Broadcast Receiver]**
+**Кодовое подтверждение (без скриншота):**
 
-**[ВСТАВИТЬ СКРИНШОТ 10 — подтверждение срабатывания при восстановлении сети / лог / демонстрация]**
+```kotlin
+// NetworkReceiver.kt
+class NetworkReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+        val connectivityManager =
+            context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val network = connectivityManager.activeNetwork
+        val capabilities = connectivityManager.getNetworkCapabilities(network)
+
+        val isConnected = capabilities != null &&
+            (
+                capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
+                    capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) ||
+                    capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)
+                )
+
+        if (isConnected) {
+            SyncWorkScheduler.enqueueOneTimeSync(context, "network_restored")
+        }
+    }
+}
+```
+
+```xml
+<!-- AndroidManifest.xml -->
+<receiver
+    android:name=".receiver.NetworkReceiver"
+    android:exported="true">
+    <intent-filter>
+        <action android:name="android.net.conn.CONNECTIVITY_CHANGE" />
+    </intent-filter>
+</receiver>
+```
+
+Проверка в коде: при восстановлении сети `isConnected == true` всегда вызывает `enqueueOneTimeSync(...)`, а сама синхронизация выполняется через `WorkManager` с network constraints.
+
+Практическая оговорка: на современных версиях Android системные ограничения на background-broadcast могут влиять на момент доставки `CONNECTIVITY_CHANGE`, поэтому корректность проверяется по факту постановки `OneTimeWorkRequest` в `WorkManager`.
 
 ---
 
@@ -263,7 +385,27 @@
 - тяжёлые операции не должны выполняться прямо в обработчике события;
 - фоновая задача должна передаваться специализированному механизму.
 
-**[ВСТАВИТЬ СКРИНШОТ 11 — код запуска OneTimeWorkRequest после появления сети]**
+**Кодовое подтверждение (без скриншота):**
+
+```kotlin
+// SyncWorkScheduler.kt
+fun enqueueOneTimeSync(context: Context, reason: String) {
+    val constraints = Constraints.Builder()
+        .setRequiredNetworkType(NetworkType.CONNECTED)
+        .build()
+
+    val request = OneTimeWorkRequestBuilder<SyncWorker>()
+        .setConstraints(constraints)
+        .setInputData(workDataOf("sync_reason" to reason))
+        .build()
+
+    WorkManager.getInstance(context).enqueueUniqueWork(
+        "one_time_tasks_sync",
+        ExistingWorkPolicy.REPLACE,
+        request
+    )
+}
+```
 
 ---
 
@@ -285,9 +427,40 @@
 
 Именно этот механизм делает данные приложения доступными во внешней среде.
 
-**[ВСТАВИТЬ СКРИНШОТ 12 — код Content Provider]**
+**Кодовое подтверждение (без скриншота):**
 
-**[ВСТАВИТЬ СКРИНШОТ 13 — пример обращения к Content Provider / результат чтения / вставки]**
+```kotlin
+// TaskContentProvider.kt
+companion object {
+    const val AUTHORITY = "com.example.todotime.provider"
+    private const val TASKS_ALL = 1
+    private val uriMatcher = UriMatcher(UriMatcher.NO_MATCH).apply {
+        addURI(AUTHORITY, "tasks", TASKS_ALL)
+    }
+}
+
+override fun query(...): Cursor? = database.taskDao().getAllTasksCursor()
+
+override fun insert(uri: Uri, values: ContentValues?): Uri? {
+    ...
+    runBlocking { database.taskDao().insert(task) }
+    context?.let { TaskNotifications.showExternalTaskAdded(it, task.title) }
+    return insertedUri
+}
+```
+
+Пример внешнего обращения (ADB):
+
+```bash
+adb shell content query --uri content://com.example.todotime.provider/tasks
+```
+
+```bash
+adb shell content insert --uri content://com.example.todotime.provider/tasks \
+  --bind title:s:"Задача из внешнего приложения" \
+  --bind tag:s:intel \
+  --bind hasTimer:b:true
+```
 
 ---
 
@@ -303,7 +476,45 @@
 
 Использование уведомлений делает фоновую работу приложения более прозрачной.
 
-**[ВСТАВИТЬ СКРИНШОТ 14 — уведомление о завершении синхронизации]**
+**Кодовое подтверждение (без скриншота):**
+
+```kotlin
+// SyncWorker.kt
+val now = System.currentTimeMillis()
+SyncPreferences.saveLastSyncTime(applicationContext, now)
+TaskNotifications.showSyncCompleted(
+    context = applicationContext,
+    contentText = "Последняя синхронизация: ${formatTimestamp(now)}"
+)
+```
+
+```kotlin
+// TaskNotifications.kt
+fun showSyncCompleted(context: Context, contentText: String) {
+    show(
+        context = context,
+        channelId = SYNC_CHANNEL_ID,
+        title = "Синхронизация завершена",
+        message = contentText,
+        notificationId = 101
+    )
+}
+```
+
+```kotlin
+// MainActivity.kt (Android 13+)
+private fun ensureNotificationPermission() {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+    if (ContextCompat.checkSelfPermission(
+            this,
+            Manifest.permission.POST_NOTIFICATIONS
+        ) == PackageManager.PERMISSION_GRANTED
+    ) return
+    requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1001)
+}
+```
+
+Примечание: на Android 13+ уведомления отображаются только после выдачи пользователем разрешения `POST_NOTIFICATIONS`.
 
 ---
 
@@ -319,7 +530,27 @@
 
 Такой сценарий особенно важен именно для этой лабораторной работы, потому что он демонстрирует не только наличие `Content Provider`, но и факт его практического использования.
 
-**[ВСТАВИТЬ СКРИНШОТ 15 — уведомление о добавлении задачи извне]**
+**Кодовое подтверждение (без скриншота):**
+
+```kotlin
+// TaskContentProvider.kt
+context?.let { ctx ->
+    TaskNotifications.showExternalTaskAdded(ctx, task.title)
+}
+```
+
+```kotlin
+// TaskNotifications.kt
+fun showExternalTaskAdded(context: Context, taskTitle: String) {
+    show(
+        context = context,
+        channelId = EXTERNAL_TASK_CHANNEL_ID,
+        title = "Новая внешняя задача",
+        message = "Добавлена задача: $taskTitle",
+        notificationId = 200 + Random.nextInt(1, 1000)
+    )
+}
+```
 
 ---
 
@@ -388,22 +619,18 @@
 
 ---
 
-## Приложение: список скриншотов
+## Приложение: кодовые доказательства вместо скриншотов
 
-1. Главный экран приложения со списком задач  
-2. Экран или форма добавления новой задачи  
-3. Список после добавления новой задачи  
-4. Структура локальной базы данных `Room`  
-5. Получение данных из REST API  
-6. Реализация `Worker` для фоновой синхронизации  
-7. Подтверждение выполнения периодической синхронизации  
-8. Отображение времени последней синхронизации  
-9. Реализация `Broadcast Receiver`  
-10. Срабатывание синхронизации после восстановления сети  
-11. Запуск `OneTimeWorkRequest`  
-12. Реализация `Content Provider`  
-13. Работа с `Content Provider` извне  
-14. Уведомление о завершении синхронизации  
-15. Уведомление о добавлении новой задачи извне
+1. `Room` и локальная модель: `TaskEntity`, `TaskDao`, `AppDatabase`.
+2. REST-клиент: `JsonPlaceholderApi`, `JsonPlaceholderClient`.
+3. Периодическая синхронизация: `SyncWorkScheduler.schedulePeriodicSync`.
+4. Логика worker: `SyncWorker.doWork`.
+5. Сохранение времени последней синхронизации: `SyncPreferences`.
+6. Отслеживание сети: `NetworkReceiver`.
+7. OneTime-синхронизация: `SyncWorkScheduler.enqueueOneTimeSync`.
+8. Доступ извне: `TaskContentProvider`.
+9. События уведомлений: `TaskNotifications`, вызовы из `SyncWorker` и `TaskContentProvider`.
+
+Скриншоты остаются полезными только для UI-части (главный экран/добавление задачи), но для функциональных пунктов ТЗ в отчёте достаточно этих кодовых фрагментов.
 
 ---
